@@ -1,21 +1,82 @@
 import request from 'request';
-import crypto from 'crypto';
+import crypto from 'node:crypto';
 import open from 'open';
-import http from 'http';
-import { internalIpV4 } from 'internal-ip';
+import http from 'node:http';
+import {internalIpV4} from 'internal-ip';
 
-let Service, Characteristic, Accessory, UUIDGen;
+import {
+  CharacteristicValue as HomebridgeCharacteristicValue,
+  API as HomebridgeAPI,
+  Characteristic as HomebridgeCharacteristic,
+  Logging as HomebridgeLogging,
+  PlatformAccessory as HomebridgePlatformAccessory,
+  PlatformConfig as HomebridgePlatformConfig,
+  Service as HomebridgeService,
+  uuid,
+  CharacteristicSetCallback,
+} from 'homebridge';
 
-export default (homebridge) => {
+interface ViessmannAPIResponse<T> {
+  data: T;
+}
+
+interface ViessmannSmartComponent {
+  id: string;
+  name: string;
+  selected: boolean;
+  deleted: boolean;
+}
+
+interface LocalDevice {
+  name: string;
+  feature: string;
+  deviceId: string;
+}
+
+interface LocalPlatform {
+  platform: string;
+  name: string;
+  clientId: string;
+  apiEndpoint: string;
+  devices: LocalDevice[];
+}
+
+interface LocalConfig {
+  platforms: LocalPlatform[];
+}
+
+let Service: typeof HomebridgeService;
+let Characteristic: typeof HomebridgeCharacteristic;
+let Accessory: typeof HomebridgePlatformAccessory;
+let UUIDGen: typeof uuid;
+
+export default (homebridge: HomebridgeAPI) => {
   Service = homebridge.hap.Service;
   Characteristic = homebridge.hap.Characteristic;
   Accessory = homebridge.platformAccessory;
   UUIDGen = homebridge.hap.uuid;
-  homebridge.registerPlatform('homebridge-vicare', 'ViCareThermostatPlatform', ViCareThermostatPlatform, true);
+  homebridge.registerPlatform('homebridge-vicare', 'ViCareThermostatPlatform', ViCareThermostatPlatform);
 };
 
 class ViCareThermostatPlatform {
-  constructor(log, config, api) {
+  private accessories: HomebridgePlatformAccessory[];
+  private accessToken?: string;
+  private api: HomebridgeAPI;
+  private apiEndpoint: string;
+  private clientId: string;
+  private codeChallenge: string;
+  private codeVerifier: string;
+  private devices: Array<HomebridgePlatformConfig & LocalConfig>;
+  private hostIp?: string;
+  private log: HomebridgeLogging;
+  private redirectUri?: string;
+  private server: http.Server | null;
+  private installationId?: string;
+  private gatewaySerial?: string;
+
+  config: HomebridgePlatformConfig & LocalConfig;
+
+  constructor(log: HomebridgeLogging, config: HomebridgePlatformConfig & LocalConfig, api: HomebridgeAPI) {
     this.log = log;
     this.config = config;
     this.api = api;
@@ -29,15 +90,15 @@ class ViCareThermostatPlatform {
 
     this.api.on('didFinishLaunching', async () => {
       this.log('Starting authentication process...');
-      this.hostIp = await internalIpV4();  // Ermittelt die lokale IP-Adresse
+      this.hostIp = await internalIpV4(); // Ermittelt die lokale IP-Adresse
       this.redirectUri = `http://${this.hostIp}:4200`;
       this.log(`Using redirect URI: ${this.redirectUri}`);
-      this.authenticate((err, accessToken) => {
+      this.authenticate((err: Error | null, accessToken?: string) => {
         if (!err) {
           this.log('Authentication successful, received access token.');
           this.accessToken = accessToken;
-          this.retrieveIds((err, installationId, gatewaySerial) => {
-            if (!err) {
+          this.retrieveIds((err: Error | null, installationId?: string, gatewaySerial?: string) => {
+            if (!err && installationId && gatewaySerial) {
               this.log('Retrieved installation and gateway IDs.');
               this.installationId = installationId;
               this.gatewaySerial = gatewaySerial;
@@ -56,7 +117,7 @@ class ViCareThermostatPlatform {
     });
   }
 
-  configureAccessory(accessory) {
+  configureAccessory(accessory: HomebridgePlatformAccessory) {
     this.accessories.push(accessory);
   }
 
@@ -64,12 +125,14 @@ class ViCareThermostatPlatform {
     return crypto.randomBytes(32).toString('base64url');
   }
 
-  generateCodeChallenge(codeVerifier) {
+  generateCodeChallenge(codeVerifier: string) {
     return crypto.createHash('sha256').update(codeVerifier).digest('base64url');
   }
 
-  authenticate(callback) {
-    const authUrl = `https://iam.viessmann.com/idp/v3/authorize?client_id=${this.clientId}&redirect_uri=${encodeURIComponent(this.redirectUri)}&scope=IoT%20User%20offline_access&response_type=code&code_challenge_method=S256&code_challenge=${this.codeChallenge}`;
+  authenticate(callback: (err: Error | null, accessToken?: string) => void) {
+    const authUrl = `https://iam.viessmann.com/idp/v3/authorize?client_id=${this.clientId}&redirect_uri=${encodeURIComponent(this.redirectUri!)}&scope=IoT%20User%20offline_access&response_type=code&code_challenge_method=S256&code_challenge=${
+      this.codeChallenge
+    }`;
 
     this.log(`Opening browser for authentication: ${authUrl}`);
     open(authUrl);
@@ -77,64 +140,69 @@ class ViCareThermostatPlatform {
     this.startServer(callback);
   }
 
-  startServer(callback) {
-    this.server = http.createServer((req, res) => {
-      const url = new URL(req.url, `http://${req.headers.host}`);
-      const authCode = url.searchParams.get('code');
-      if (authCode) {
-        this.log('Received authorization code:', authCode);
-        res.writeHead(200, { 'Content-Type': 'text/plain' });
-        res.end('Authorization successful. You can close this window.');
-        this.exchangeCodeForToken(authCode, (err, accessToken) => {
-          this.server.close();
-          callback(err, accessToken);
-        });
-      } else {
-        res.writeHead(400, { 'Content-Type': 'text/plain' });
-        res.end('Authorization code not found.');
-      }
-    }).listen(4200, this.hostIp, () => {
-      this.log(`Server is listening on ${this.hostIp}:4200`);
-    });
+  startServer(callback: (err: Error | null, accessToken?: string) => void) {
+    this.server = http
+      .createServer((req, res) => {
+        const url = new URL(req.url || '127.0.0.1', `http://${req.headers.host}`);
+        const authCode = url.searchParams.get('code');
+        if (authCode) {
+          this.log('Received authorization code:', authCode);
+          res.writeHead(200, {'Content-Type': 'text/plain'});
+          res.end('Authorization successful. You can close this window.');
+          this.exchangeCodeForToken(authCode, (err: Error | null, accessToken?: string) => {
+            this.server?.close();
+            callback(err, accessToken);
+          });
+        } else {
+          res.writeHead(400, {'Content-Type': 'text/plain'});
+          res.end('Authorization code not found.');
+        }
+      })
+      .listen(4200, this.hostIp, () => {
+        this.log(`Server is listening on ${this.hostIp}:4200`);
+      });
   }
 
-  exchangeCodeForToken(authCode, callback) {
+  exchangeCodeForToken(authCode: string, callback: (err: Error | null, accessToken?: string) => void) {
     const tokenUrl = 'https://iam.viessmann.com/idp/v3/token';
     const params = {
       client_id: this.clientId,
       redirect_uri: this.redirectUri,
       grant_type: 'authorization_code',
       code_verifier: this.codeVerifier,
-      code: authCode
+      code: authCode,
     };
 
     this.log('Exchanging authorization code for access token...');
-    request.post({
-      url: tokenUrl,
-      form: params,
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded'
-      }
-    }, (error, response, body) => {
-      if (error || response.statusCode !== 200) {
-        this.log('Error exchanging code for token:', error || body);
-        callback(error || new Error(body));
-        return;
-      }
+    request.post(
+      {
+        url: tokenUrl,
+        form: params,
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+      },
+      (error, response, body) => {
+        if (error || response.statusCode !== 200) {
+          this.log('Error exchanging code for token:', error || body);
+          callback(error || new Error(body));
+          return;
+        }
 
-      this.log('Successfully exchanged code for access token.');
-      const tokenResponse = JSON.parse(body);
-      callback(null, tokenResponse.access_token);
-    });
+        this.log('Successfully exchanged code for access token.');
+        const tokenResponse = JSON.parse(body);
+        callback(null, tokenResponse.access_token);
+      }
+    );
   }
 
-  retrieveIds(callback) {
+  retrieveIds(callback: (err: Error | null, installationId?: string, gatewaySerial?: string) => void) {
     const options = {
       url: `${this.apiEndpoint}/equipment/installations`,
       headers: {
-        'Authorization': `Bearer ${this.accessToken}`,
+        Authorization: `Bearer ${this.accessToken}`,
       },
-      json: true
+      json: true,
     };
 
     this.log('Retrieving installation IDs...');
@@ -152,9 +220,9 @@ class ViCareThermostatPlatform {
       const gatewayOptions = {
         url: `${this.apiEndpoint}/equipment/installations/${installationId}/gateways`,
         headers: {
-          'Authorization': `Bearer ${this.accessToken}`,
+          Authorization: `Bearer ${this.accessToken}`,
         },
-        json: true
+        json: true,
       };
 
       this.log('Retrieving gateway IDs...');
@@ -183,13 +251,13 @@ class ViCareThermostatPlatform {
     const options = {
       url: `${this.apiEndpoint}/equipment/installations/${this.installationId}/smartComponents`,
       headers: {
-        'Authorization': `Bearer ${this.accessToken}`,
+        Authorization: `Bearer ${this.accessToken}`,
       },
-      json: true
+      json: true,
     };
 
     this.log('Retrieving smart components...');
-    request.get(options, (error, response, body) => {
+    request.get(options, (error, response, body: ViessmannAPIResponse<ViessmannSmartComponent[]>) => {
       if (error || response.statusCode !== 200) {
         this.log('Error retrieving smart components:', error || body);
         return;
@@ -197,41 +265,46 @@ class ViCareThermostatPlatform {
 
       this.log('Successfully retrieved smart components:', body);
       body.data.forEach(component => {
-        this.log(`Component ID: ${component.id}, Name: ${component.name}, Selected: ${component.selected}, Deleted: ${component.deleted}`);
+        this.log(
+          `Component ID: ${component.id}, Name: ${component.name}, Selected: ${component.selected}, Deleted: ${component.deleted}`
+        );
       });
     });
   }
 
-  selectSmartComponents(componentIds, callback) {
+  selectSmartComponents(
+    componentIds: string[],
+    callback: (err: Error | null, result?: ViessmannAPIResponse<ViessmannSmartComponent[]>) => void
+  ) {
     const options = {
       url: `${this.apiEndpoint}/equipment/installations/${this.installationId}/smartComponents`,
       headers: {
-        'Authorization': `Bearer ${this.accessToken}`,
-        'Content-Type': 'application/json'
+        Authorization: `Bearer ${this.accessToken}`,
+        'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ selected: componentIds })
+      body: JSON.stringify({selected: componentIds}),
     };
 
     this.log('Selecting smart components...');
-    request.put(options, (error, response, body) => {
+    request.put(options, (error, response, body: string) => {
       if (error || response.statusCode !== 200) {
         this.log('Error selecting smart components:', error || body);
         callback(error || new Error(body));
         return;
       }
 
-      const result = JSON.parse(body);
+      const result: ViessmannAPIResponse<ViessmannSmartComponent[]> = JSON.parse(body);
       this.log('Successfully selected smart components:', result);
       callback(null, result);
     });
   }
 
-  addAccessory(deviceConfig) {
-    const uuid = UUIDGen.generate(deviceConfig.name);
+  addAccessory(deviceConfig: HomebridgePlatformConfig & LocalConfig): void {
+    const uuid = UUIDGen.generate(deviceConfig.name || new Date().getTime().toString());
     let accessory = this.accessories.find(acc => acc.UUID === uuid);
 
     if (!accessory) {
-      accessory = new Accessory(deviceConfig.name, uuid);
+      accessory = new Accessory(deviceConfig.name || new Date().getTime().toString(), uuid);
       this.api.registerPlatformAccessories('homebridge-vicare', 'ViCareThermostatPlatform', [accessory]);
       this.accessories.push(accessory);
       this.log(`Added new accessory: ${deviceConfig.name}`);
@@ -241,20 +314,21 @@ class ViCareThermostatPlatform {
       this.log,
       deviceConfig,
       this.api,
-      this.accessToken,
+      this.accessToken!,
       this.apiEndpoint,
-      this.installationId,
-      this.gatewaySerial
+      this.installationId!,
+      this.gatewaySerial!
     );
 
     accessory.context.deviceConfig = deviceConfig;
-    accessory.getService(Service.AccessoryInformation)
-      .setCharacteristic(Characteristic.Manufacturer, 'Viessmann')
+    accessory
+      .getService(Service.AccessoryInformation)
+      ?.setCharacteristic(Characteristic.Manufacturer, 'Viessmann')
       .setCharacteristic(Characteristic.Model, 'ViCare')
       .setCharacteristic(Characteristic.SerialNumber, 'Default-Serial');
 
     vicareAccessory.getServices().forEach(service => {
-      const existingService = accessory.getServiceById(service.UUID, service.subtype);
+      const existingService = accessory.getServiceById(service.UUID, service.subtype || '');
       if (existingService) {
         accessory.removeService(existingService);
       }
@@ -266,7 +340,27 @@ class ViCareThermostatPlatform {
 }
 
 class ViCareThermostatAccessory {
-  constructor(log, config, api, accessToken, apiEndpoint, installationId, gatewaySerial) {
+  private log: HomebridgeLogging;
+  private name?: string;
+  private feature: string;
+  private apiEndpoint: string;
+  private accessToken: string;
+  private deviceId: string;
+  private installationId: string;
+  private gatewaySerial: string;
+  private temperatureService: HomebridgeService;
+  private services: HomebridgeService[];
+  private switchService?: HomebridgeService;
+
+  constructor(
+    log: HomebridgeLogging,
+    config: HomebridgePlatformConfig,
+    _api: HomebridgeAPI,
+    accessToken: string,
+    apiEndpoint: string,
+    installationId: string,
+    gatewaySerial: string
+  ) {
     this.log = log;
     this.name = config.name;
     this.feature = config.feature;
@@ -276,13 +370,19 @@ class ViCareThermostatAccessory {
     this.installationId = installationId;
     this.gatewaySerial = gatewaySerial;
 
-    this.temperatureService = new Service.TemperatureSensor(this.name, `temperatureService_${this.name}_${this.feature}_${UUIDGen.generate(this.name + this.feature)}`);
+    this.temperatureService = new Service.TemperatureSensor(
+      this.name,
+      `temperatureService_${this.name}_${this.feature}_${UUIDGen.generate(this.name + this.feature)}`
+    );
     this.temperatureService
       .getCharacteristic(Characteristic.CurrentTemperature)
       .on('get', this.getTemperature.bind(this));
 
     if (config.feature.includes('burners')) {
-      this.switchService = new Service.Switch(this.name, `switchService_${this.name}_${this.feature}_${UUIDGen.generate(this.name + this.feature)}`);
+      this.switchService = new Service.Switch(
+        this.name,
+        `switchService_${this.name}_${this.feature}_${UUIDGen.generate(this.name + this.feature)}`
+      );
       this.switchService
         .getCharacteristic(Characteristic.On)
         .on('get', this.getBurnerStatus.bind(this))
@@ -295,7 +395,7 @@ class ViCareThermostatAccessory {
     }
   }
 
-  getTemperature(callback) {
+  getTemperature(callback: (err: Error | null, temp?: number) => void) {
     const url = `${this.apiEndpoint}/features/installations/${this.installationId}/gateways/${this.gatewaySerial}/devices/${this.deviceId}/features/${this.feature}`;
     this.log(`Fetching temperature from ${url}`);
     request.get(
@@ -324,7 +424,7 @@ class ViCareThermostatAccessory {
     );
   }
 
-  getBurnerStatus(callback) {
+  getBurnerStatus(callback: (err: Error | null, isActive?: boolean) => void) {
     const url = `${this.apiEndpoint}/features/installations/${this.installationId}/gateways/${this.gatewaySerial}/devices/${this.deviceId}/features/${this.feature}`;
     this.log(`Fetching burner status from ${url}`);
     request.get(
@@ -353,7 +453,7 @@ class ViCareThermostatAccessory {
     );
   }
 
-  setBurnerStatus(value, callback) {
+  setBurnerStatus(_value: HomebridgeCharacteristicValue, callback: CharacteristicSetCallback) {
     callback(null);
   }
 
