@@ -70,7 +70,6 @@ class ViCareThermostatPlatform {
   private hostIp?: string;
   private log: HomebridgeLogging;
   private redirectUri?: string;
-  private server: http.Server | null;
   private installationId?: string;
   private gatewaySerial?: string;
 
@@ -86,34 +85,35 @@ class ViCareThermostatPlatform {
     this.accessories = [];
     this.codeVerifier = this.generateCodeVerifier();
     this.codeChallenge = this.generateCodeChallenge(this.codeVerifier);
-    this.server = null;
 
     this.api.on('didFinishLaunching', async () => {
       this.log('Starting authentication process...');
       this.hostIp = await internalIpV4(); // Ermittelt die lokale IP-Adresse
       this.redirectUri = `http://${this.hostIp}:4200`;
       this.log(`Using redirect URI: ${this.redirectUri}`);
-      this.authenticate((err: Error | null, accessToken?: string) => {
-        if (!err) {
-          this.log('Authentication successful, received access token.');
-          this.accessToken = accessToken;
-          this.retrieveIds((err: Error | null, installationId?: string, gatewaySerial?: string) => {
-            if (!err && installationId && gatewaySerial) {
-              this.log('Retrieved installation and gateway IDs.');
-              this.installationId = installationId;
-              this.gatewaySerial = gatewaySerial;
-              this.devices.forEach(deviceConfig => {
-                this.addAccessory(deviceConfig);
-              });
-              this.retrieveSmartComponents();
-            } else {
-              this.log('Error retrieving installation or gateway IDs:', err);
-            }
-          });
-        } else {
-          this.log('Error during authentication:', err);
+      try {
+        const {accessToken} = await this.authenticate();
+        this.log('Authentication successful, received access token.');
+        this.accessToken = accessToken;
+        try {
+          const {installationId, gatewaySerial} = await this.retrieveIds();
+          if (installationId && gatewaySerial) {
+            this.log('Retrieved installation and gateway IDs.');
+            this.installationId = installationId;
+            this.gatewaySerial = gatewaySerial;
+            this.devices.forEach(deviceConfig => {
+              this.addAccessory(deviceConfig);
+            });
+            this.retrieveSmartComponents();
+          } else {
+            this.log('Error retrieving installation or gateway IDs');
+          }
+        } catch (error) {
+          this.log('Error retrieving installation or gateway IDs:', error);
         }
-      });
+      } catch (error) {
+        this.log('Error during authentication:', error);
+      }
     });
   }
 
@@ -129,41 +129,43 @@ class ViCareThermostatPlatform {
     return crypto.createHash('sha256').update(codeVerifier).digest('base64url');
   }
 
-  authenticate(callback: (err: Error | null, accessToken?: string) => void) {
+  async authenticate(): Promise<{accessToken: string}> {
     const authUrl = `https://iam.viessmann.com/idp/v3/authorize?client_id=${this.clientId}&redirect_uri=${encodeURIComponent(this.redirectUri!)}&scope=IoT%20User%20offline_access&response_type=code&code_challenge_method=S256&code_challenge=${
       this.codeChallenge
     }`;
 
     this.log(`Opening browser for authentication: ${authUrl}`);
-    open(authUrl);
+    await open(authUrl);
 
-    this.startServer(callback);
+    return await this.startServer();
   }
 
-  startServer(callback: (err: Error | null, accessToken?: string) => void) {
-    this.server = http
-      .createServer((req, res) => {
-        const url = new URL(req.url || '127.0.0.1', `http://${req.headers.host}`);
-        const authCode = url.searchParams.get('code');
-        if (authCode) {
-          this.log('Received authorization code:', authCode);
-          res.writeHead(200, {'Content-Type': 'text/plain'});
-          res.end('Authorization successful. You can close this window.');
-          this.exchangeCodeForToken(authCode, (err: Error | null, accessToken?: string) => {
-            this.server?.close();
-            callback(err, accessToken);
-          });
-        } else {
-          res.writeHead(400, {'Content-Type': 'text/plain'});
-          res.end('Authorization code not found.');
-        }
-      })
-      .listen(4200, this.hostIp, () => {
-        this.log(`Server is listening on ${this.hostIp}:4200`);
-      });
+  startServer(): Promise<{accessToken: string}> {
+    return new Promise(resolve => {
+      let server = http
+        .createServer((req, res) => {
+          const url = new URL(req.url || '127.0.0.1', `http://${req.headers.host}`);
+          const authCode = url.searchParams.get('code');
+          if (authCode) {
+            this.log('Received authorization code:', authCode);
+            res.writeHead(200, {'Content-Type': 'text/plain'});
+            res.end('Authorization successful. You can close this window.');
+            this.exchangeCodeForToken(authCode).then(({accessToken}) => {
+              server.close();
+              resolve({accessToken});
+            });
+          } else {
+            res.writeHead(400, {'Content-Type': 'text/plain'});
+            res.end('Authorization code not found.');
+          }
+        })
+        .listen(4200, this.hostIp, () => {
+          this.log(`Server is listening on ${this.hostIp}:4200`);
+        });
+    });
   }
 
-  exchangeCodeForToken(authCode: string, callback: (err: Error | null, accessToken?: string) => void) {
+  exchangeCodeForToken(authCode: string): Promise<{accessToken: string}> {
     const tokenUrl = 'https://iam.viessmann.com/idp/v3/token';
     const params = {
       client_id: this.clientId,
@@ -174,29 +176,31 @@ class ViCareThermostatPlatform {
     };
 
     this.log('Exchanging authorization code for access token...');
-    request.post(
-      {
-        url: tokenUrl,
-        form: params,
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-        },
-      },
-      (error, response, body) => {
-        if (error || response.statusCode !== 200) {
-          this.log('Error exchanging code for token:', error || body);
-          callback(error || new Error(body));
-          return;
-        }
 
-        this.log('Successfully exchanged code for access token.');
-        const tokenResponse = JSON.parse(body);
-        callback(null, tokenResponse.access_token);
-      }
-    );
+    return new Promise((resolve, reject) => {
+      request.post(
+        {
+          url: tokenUrl,
+          form: params,
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+          },
+        },
+        (error, response, body) => {
+          if (error || response.statusCode !== 200) {
+            this.log('Error exchanging code for token:', error || body);
+            return reject(error || new Error(body));
+          }
+
+          this.log('Successfully exchanged code for access token.');
+          const tokenResponse = JSON.parse(body);
+          resolve({accessToken: tokenResponse.access_token});
+        }
+      );
+    });
   }
 
-  retrieveIds(callback: (err: Error | null, installationId?: string, gatewaySerial?: string) => void) {
+  retrieveIds(): Promise<{installationId?: string; gatewaySerial?: string}> {
     const options = {
       url: `${this.apiEndpoint}/equipment/installations`,
       headers: {
@@ -206,43 +210,44 @@ class ViCareThermostatPlatform {
     };
 
     this.log('Retrieving installation IDs...');
-    request.get(options, (error, response, body) => {
-      if (error || response.statusCode !== 200) {
-        this.log('Error retrieving installations:', error || body);
-        callback(error || new Error(body));
-        return;
-      }
 
-      this.log('Successfully retrieved installations:', body);
-      const installation = body.data[0];
-      const installationId = installation.id;
-
-      const gatewayOptions = {
-        url: `${this.apiEndpoint}/equipment/installations/${installationId}/gateways`,
-        headers: {
-          Authorization: `Bearer ${this.accessToken}`,
-        },
-        json: true,
-      };
-
-      this.log('Retrieving gateway IDs...');
-      request.get(gatewayOptions, (error, response, body) => {
+    return new Promise((resolve, reject) => {
+      request.get(options, (error, response, body) => {
         if (error || response.statusCode !== 200) {
-          this.log('Error retrieving gateways:', error || body);
-          callback(error || new Error(body));
-          return;
+          this.log('Error retrieving installations:', error || body);
+          throw error || new Error(body);
         }
 
-        this.log('Successfully retrieved gateways:', body);
-        if (!body.data || body.data.length === 0) {
-          this.log('No gateway data available.');
-          callback(new Error('No gateway data available.'));
-          return;
-        }
+        this.log('Successfully retrieved installations:', body);
+        const installation = body.data[0];
+        const installationId = installation.id;
 
-        const gateway = body.data[0];
-        const gatewaySerial = gateway.serial;
-        callback(null, installationId, gatewaySerial);
+        const gatewayOptions = {
+          url: `${this.apiEndpoint}/equipment/installations/${installationId}/gateways`,
+          headers: {
+            Authorization: `Bearer ${this.accessToken}`,
+          },
+          json: true,
+        };
+
+        this.log('Retrieving gateway IDs...');
+        request.get(gatewayOptions, (error, response, body) => {
+          if (error || response.statusCode !== 200) {
+            this.log('Error retrieving gateways:', error || body);
+            return reject(error || new Error(body));
+          }
+
+          this.log('Successfully retrieved gateways:', body);
+
+          if (!body.data || body.data.length === 0) {
+            this.log('No gateway data available.');
+            return reject(new Error('No gateway data available.'));
+          }
+
+          const gateway = body.data[0];
+          const gatewaySerial = gateway.serial;
+          resolve({installationId, gatewaySerial});
+        });
       });
     });
   }
@@ -272,10 +277,7 @@ class ViCareThermostatPlatform {
     });
   }
 
-  selectSmartComponents(
-    componentIds: string[],
-    callback: (err: Error | null, result?: ViessmannAPIResponse<ViessmannSmartComponent[]>) => void
-  ) {
+  selectSmartComponents(componentIds: string[]): Promise<{result: ViessmannAPIResponse<ViessmannSmartComponent[]>}> {
     const options = {
       url: `${this.apiEndpoint}/equipment/installations/${this.installationId}/smartComponents`,
       headers: {
@@ -286,16 +288,18 @@ class ViCareThermostatPlatform {
     };
 
     this.log('Selecting smart components...');
-    request.put(options, (error, response, body: string) => {
-      if (error || response.statusCode !== 200) {
-        this.log('Error selecting smart components:', error || body);
-        callback(error || new Error(body));
-        return;
-      }
 
-      const result: ViessmannAPIResponse<ViessmannSmartComponent[]> = JSON.parse(body);
-      this.log('Successfully selected smart components:', result);
-      callback(null, result);
+    return new Promise((resolve, reject) => {
+      request.put(options, (error, response, body: string) => {
+        if (error || response.statusCode !== 200) {
+          this.log('Error selecting smart components:', error || body);
+          return reject(error || new Error(body));
+        }
+
+        const result: ViessmannAPIResponse<ViessmannSmartComponent[]> = JSON.parse(body);
+        this.log('Successfully selected smart components:', result);
+        resolve({result});
+      });
     });
   }
 
@@ -395,62 +399,67 @@ class ViCareThermostatAccessory {
     }
   }
 
-  getTemperature(callback: (err: Error | null, temp?: number) => void) {
+  getTemperature(): Promise<{temp: number}> {
     const url = `${this.apiEndpoint}/features/installations/${this.installationId}/gateways/${this.gatewaySerial}/devices/${this.deviceId}/features/${this.feature}`;
     this.log(`Fetching temperature from ${url}`);
-    request.get(
-      {
-        url: url,
-        headers: {
-          Authorization: `Bearer ${this.accessToken}`,
+    return new Promise((resolve, reject) => {
+      request.get(
+        {
+          url: url,
+          headers: {
+            Authorization: `Bearer ${this.accessToken}`,
+          },
+          json: true,
         },
-        json: true,
-      },
-      (error, response, body) => {
-        if (!error && response.statusCode === 200) {
-          const data = body.data || body;
-          if (data.properties && data.properties.value && data.properties.value.value !== undefined) {
-            const temp = data.properties.value.value;
-            callback(null, temp);
+        (error, response, body) => {
+          if (!error && response.statusCode === 200) {
+            const data = body.data || body;
+            if (data.properties && data.properties.value && data.properties.value.value !== undefined) {
+              const temp = data.properties.value.value;
+              resolve({temp});
+            } else {
+              this.log('Unexpected response structure:', data);
+              reject(new Error('Unexpected response structure.'));
+            }
           } else {
-            this.log('Unexpected response structure:', data);
-            callback(new Error('Unexpected response structure.'));
+            this.log('Error fetching temperature:', error || body);
+            reject(error || new Error(body));
           }
-        } else {
-          this.log('Error fetching temperature:', error || body);
-          callback(error || new Error(body));
         }
-      }
-    );
+      );
+    });
   }
 
-  getBurnerStatus(callback: (err: Error | null, isActive?: boolean) => void) {
+  getBurnerStatus(): Promise<{isActive: boolean}> {
     const url = `${this.apiEndpoint}/features/installations/${this.installationId}/gateways/${this.gatewaySerial}/devices/${this.deviceId}/features/${this.feature}`;
     this.log(`Fetching burner status from ${url}`);
-    request.get(
-      {
-        url: url,
-        headers: {
-          Authorization: `Bearer ${this.accessToken}`,
+
+    return new Promise((resolve, reject) => {
+      request.get(
+        {
+          url: url,
+          headers: {
+            Authorization: `Bearer ${this.accessToken}`,
+          },
+          json: true,
         },
-        json: true,
-      },
-      (error, response, body) => {
-        if (!error && response.statusCode === 200) {
-          const data = body.data || body;
-          if (data.properties && data.properties.active && data.properties.active.value !== undefined) {
-            const isActive = data.properties.active.value;
-            callback(null, isActive);
+        (error, response, body) => {
+          if (!error && response.statusCode === 200) {
+            const data = body.data || body;
+            if (data.properties && data.properties.active && data.properties.active.value !== undefined) {
+              const isActive = data.properties.active.value;
+              resolve({isActive});
+            } else {
+              this.log('Unexpected response structure:', data);
+              reject(new Error('Unexpected response structure.'));
+            }
           } else {
-            this.log('Unexpected response structure:', data);
-            callback(new Error('Unexpected response structure.'));
+            this.log('Error fetching burner status:', error || body);
+            reject(error || new Error(body));
           }
-        } else {
-          this.log('Error fetching burner status:', error || body);
-          callback(error || new Error(body));
         }
-      }
-    );
+      );
+    });
   }
 
   setBurnerStatus(_value: HomebridgeCharacteristicValue, callback: CharacteristicSetCallback) {
